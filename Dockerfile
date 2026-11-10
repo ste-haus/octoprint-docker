@@ -1,5 +1,5 @@
-ARG PYTHON_VERSION=3.10
-ARG DEBIAN_RELEASE=bullseye
+ARG PYTHON_VERSION=3.13
+ARG DEBIAN_RELEASE=trixie
 ARG PYTHON_BASE_IMAGE=${PYTHON_VERSION}-slim-${DEBIAN_RELEASE}
 
 # Obico's bundled Janus is 0.11.x and its generated streaming config uses the
@@ -8,11 +8,6 @@ ARG JANUS_VERSION=0.16.3
 ARG JANUS_REPO=https://github.com/meetecho/janus-gateway.git
 ARG JANUS_PREFIX=/usr
 ARG JANUS_DEB=/tmp/janus.deb
-
-# Bullseye is EOL: its security pool has moved to the archive while
-# deb.debian.org still advertises it, so fetch everything from the archive.
-ARG DEBIAN_ARCHIVE_MIRROR=http://archive.debian.org
-ARG APT_SOURCES_FILE=/etc/apt/sources.list
 
 FROM ubuntu AS s6build
 ARG S6_RELEASE
@@ -37,9 +32,6 @@ RUN ARCH= && dpkgArch="$(dpkg --print-architecture)" \
 # accepts a system Janus it can locate with `dpkg -L janus`.
 FROM debian:${DEBIAN_RELEASE}-slim AS janus-builder
 
-ARG DEBIAN_RELEASE
-ARG DEBIAN_ARCHIVE_MIRROR
-ARG APT_SOURCES_FILE
 ARG JANUS_VERSION
 ARG JANUS_REPO
 ARG JANUS_PREFIX
@@ -47,17 +39,13 @@ ARG JANUS_DEB
 
 ARG JANUS_SRC_DIR=/tmp/janus-src
 ARG JANUS_STAGING_DIR=/tmp/janus-root
-
-RUN printf '%s\n' \
-      "deb ${DEBIAN_ARCHIVE_MIRROR}/debian ${DEBIAN_RELEASE} main" \
-      "deb ${DEBIAN_ARCHIVE_MIRROR}/debian ${DEBIAN_RELEASE}-updates main" \
-      "deb ${DEBIAN_ARCHIVE_MIRROR}/debian-security ${DEBIAN_RELEASE}-security main" \
-      > "${APT_SOURCES_FILE}"
+ARG JANUS_SHLIBDEPS_DIR=/tmp/janus-shlibdeps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       autoconf \
       automake \
       ca-certificates \
+      dpkg-dev \
       gcc \
       gengetopt \
       git \
@@ -94,34 +82,36 @@ RUN sh autogen.sh \
     && make -j"$(nproc)" \
     && make DESTDIR="${JANUS_STAGING_DIR}" install-strip
 
-# Depends lists the runtime libraries so apt pulls them into the final image
-RUN mkdir -p "${JANUS_STAGING_DIR}/DEBIAN" \
+# Depends lists the runtime libraries so apt pulls them into the final image.
+# dpkg-shlibdeps derives them from the built binaries, so the names track the
+# Debian release, and it needs a stub debian/control to run outside a source tree.
+RUN mkdir -p "${JANUS_SHLIBDEPS_DIR}/debian" "${JANUS_STAGING_DIR}/DEBIAN" \
+    && printf '%s\n' "Source: janus" "" "Package: janus" "Architecture: any" \
+         > "${JANUS_SHLIBDEPS_DIR}/debian/control" \
+    && cd "${JANUS_SHLIBDEPS_DIR}" \
+    && janus_depends="$(find "${JANUS_STAGING_DIR}${JANUS_PREFIX}/bin" "${JANUS_STAGING_DIR}${JANUS_PREFIX}/lib/janus" \
+         -type f \( -name janus -o -name '*.so*' \) -print0 \
+         | xargs -0 dpkg-shlibdeps -O 2>/dev/null \
+         | sed -n 's/^shlibs:Depends=//p')" \
+    && test -n "${janus_depends}" \
     && printf '%s\n' \
          "Package: janus" \
          "Version: ${JANUS_VERSION}" \
          "Architecture: $(dpkg --print-architecture)" \
          "Maintainer: ste.haus" \
-         "Depends: libconfig9, libcurl4, libglib2.0-0, libjansson4, libnice10, libsrtp2-1, libssl1.1, libusrsctp1, libwebsockets16, zlib1g" \
+         "Depends: ${janus_depends}" \
          "Description: Janus WebRTC gateway, local build for the Obico plugin" \
          > "${JANUS_STAGING_DIR}/DEBIAN/control" \
+    && cat "${JANUS_STAGING_DIR}/DEBIAN/control" \
     && dpkg-deb --build "${JANUS_STAGING_DIR}" "${JANUS_DEB}"
 
 
 FROM python:${PYTHON_BASE_IMAGE} AS build
 
-ARG DEBIAN_RELEASE
-ARG DEBIAN_ARCHIVE_MIRROR
-ARG APT_SOURCES_FILE
 ARG JANUS_DEB
 
 ARG octoprint_ref
 ENV octoprint_ref ${octoprint_ref:-master}
-
-RUN printf '%s\n' \
-      "deb ${DEBIAN_ARCHIVE_MIRROR}/debian ${DEBIAN_RELEASE} main" \
-      "deb ${DEBIAN_ARCHIVE_MIRROR}/debian ${DEBIAN_RELEASE}-updates main" \
-      "deb ${DEBIAN_ARCHIVE_MIRROR}/debian-security ${DEBIAN_RELEASE}-security main" \
-      > "${APT_SOURCES_FILE}"
 
 RUN apt-get update && apt-get install -y \
   avrdude \
@@ -154,8 +144,11 @@ RUN apt-get install -y --no-install-recommends "${JANUS_DEB}" \
 
 # unpack s6
 COPY --from=s6build /tmp /tmp
+# /bin is a symlink to /usr/bin on merged-/usr releases, and extracting the
+# tarball's ./bin over it replaces the symlink, so unpack ./bin into /usr
 RUN s6tar=$(find /tmp -name "s6-overlay-*.tar.gz") \
-  && tar xzf $s6tar -C / 
+  && tar xzf $s6tar -C / --exclude="./bin" \
+  && tar xzf $s6tar -C /usr ./bin
 
 # Install octoprint
 RUN	curl -fsSLO --compressed --retry 3 --retry-delay 10 \
