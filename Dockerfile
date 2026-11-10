@@ -9,11 +9,13 @@ ARG JANUS_REPO=https://github.com/meetecho/janus-gateway.git
 ARG JANUS_PREFIX=/usr
 ARG JANUS_DEB=/tmp/janus.deb
 
-FROM ubuntu AS s6build
+ARG S6_DOWNLOAD_UBUNTU_RELEASE=24.04
+
+FROM ubuntu:${S6_DOWNLOAD_UBUNTU_RELEASE} AS s6build
 ARG S6_RELEASE
 ENV S6_VERSION ${S6_RELEASE:-v2.1.0.0}
 RUN apt-get update && apt-get install -y curl
-RUN echo "$(dpkg --print-architecture)"
+RUN dpkg --print-architecture
 WORKDIR /tmp
 RUN ARCH= && dpkgArch="$(dpkg --print-architecture)" \
   && case "${dpkgArch##*-}" in \
@@ -31,6 +33,8 @@ RUN ARCH= && dpkgArch="$(dpkg --print-architecture)" \
 # Build Janus and wrap it in a .deb named "janus". The Obico plugin only
 # accepts a system Janus it can locate with `dpkg -L janus`.
 FROM debian:${DEBIAN_RELEASE}-slim AS janus-builder
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG JANUS_VERSION
 ARG JANUS_REPO
@@ -85,10 +89,10 @@ RUN sh autogen.sh \
 # Depends lists the runtime libraries so apt pulls them into the final image.
 # dpkg-shlibdeps derives them from the built binaries, so the names track the
 # Debian release, and it needs a stub debian/control to run outside a source tree.
-RUN mkdir -p "${JANUS_SHLIBDEPS_DIR}/debian" "${JANUS_STAGING_DIR}/DEBIAN" \
+WORKDIR ${JANUS_SHLIBDEPS_DIR}
+RUN mkdir -p debian "${JANUS_STAGING_DIR}/DEBIAN" \
     && printf '%s\n' "Source: janus" "" "Package: janus" "Architecture: any" \
-         > "${JANUS_SHLIBDEPS_DIR}/debian/control" \
-    && cd "${JANUS_SHLIBDEPS_DIR}" \
+         > debian/control \
     && janus_depends="$(find "${JANUS_STAGING_DIR}${JANUS_PREFIX}/bin" "${JANUS_STAGING_DIR}${JANUS_PREFIX}/lib/janus" \
          -type f \( -name janus -o -name '*.so*' \) -print0 \
          | xargs -0 dpkg-shlibdeps -O 2>/dev/null \
@@ -110,8 +114,11 @@ FROM python:${PYTHON_BASE_IMAGE} AS build
 
 ARG JANUS_DEB
 
+# OctoPrint's version comes from OCTOPRINT_VERSION in .env; octoprint_ref
+# overrides it for one-off builds of another tag or branch
 ARG octoprint_ref
-ENV octoprint_ref ${octoprint_ref:-master}
+ARG BUILD_ENV_FILE=/tmp/build.env
+ARG OCTOPRINT_SRC_DIR=/opt/octoprint
 
 RUN apt-get update && apt-get install -y \
   avrdude \
@@ -147,17 +154,22 @@ COPY --from=s6build /tmp /tmp
 # /bin is a symlink to /usr/bin on merged-/usr releases, and extracting the
 # tarball's ./bin over it replaces the symlink, so unpack ./bin into /usr
 RUN s6tar=$(find /tmp -name "s6-overlay-*.tar.gz") \
-  && tar xzf $s6tar -C / --exclude="./bin" \
-  && tar xzf $s6tar -C /usr ./bin
+  && tar xzf "$s6tar" -C / --exclude="./bin" \
+  && tar xzf "$s6tar" -C /usr ./bin
 
 # Install octoprint
-RUN	curl -fsSLO --compressed --retry 3 --retry-delay 10 \
-  https://github.com/OctoPrint/OctoPrint/archive/${octoprint_ref}.tar.gz \
-	&& mkdir -p /opt/octoprint \
-  && tar xzf ${octoprint_ref}.tar.gz --strip-components 1 -C /opt/octoprint --no-same-owner
+RUN --mount=type=bind,source=.env,target=${BUILD_ENV_FILE} \
+  . "${BUILD_ENV_FILE}" \
+  && octoprint_ref="${octoprint_ref:-${OCTOPRINT_VERSION}}" \
+  && test -n "${octoprint_ref}" \
+  && echo "Installing OctoPrint ${octoprint_ref}" \
+  && curl -fsSLO --compressed --retry 3 --retry-delay 10 \
+       "https://github.com/OctoPrint/OctoPrint/archive/${octoprint_ref}.tar.gz" \
+  && mkdir -p "${OCTOPRINT_SRC_DIR}" \
+  && tar xzf "${octoprint_ref}.tar.gz" --strip-components 1 -C "${OCTOPRINT_SRC_DIR}" --no-same-owner
 
-WORKDIR /opt/octoprint
-RUN pip install .
+WORKDIR ${OCTOPRINT_SRC_DIR}
+RUN pip install --no-cache-dir .
 RUN mkdir -p /octoprint/octoprint /octoprint/plugins
 
 # Install mjpg-streamer

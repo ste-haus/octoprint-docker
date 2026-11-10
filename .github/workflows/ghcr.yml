@@ -1,4 +1,12 @@
-name: Publish to GHCR
+name: Image
+
+# Pull requests lint, build, and smoke-test the image. Pushes to main do the
+# same, then publish it to GHCR and tag the repo with the image version.
+#
+# The image version is OCTOPRINT_VERSION from .env plus a -N suffix: N counts
+# the merge commits on main since OCTOPRINT_VERSION last changed, including the
+# one that changed it, so each merged PR bumps it and a new OctoPrint version
+# resets it to 1. Only merge commits publish.
 
 on:
   push:
@@ -12,25 +20,111 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  OCTOPRINT_VERSION: 1.11.8
   PLATFORMS: linux/amd64
-  DEFAULT_BRANCH: main
-
-permissions:
-  contents: read
-  packages: write
+  PUBLISH: ${{ github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch }}
+  VERSION_ENV_FILE: .env
+  VERSION_KEY: OCTOPRINT_VERSION
+  SMOKE_IMAGE: octoprint-docker:smoke
+  HADOLINT_VERSION: v2.12.0
+  ACTIONLINT_VERSION: 1.7.12
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build:
+  lint:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Upstream's workflows are owner-gated and never run here, so only ours is linted
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "${ACTIONLINT_VERSION}"
+          ./actionlint -color .github/workflows/ghcr.yml
+
+      # The s6 scripts use with-contenv shebangs, so the shell is given explicitly;
+      # haproxy/run is execline and is skipped
+      - name: shellcheck
+        run: |
+          shellcheck -s bash root/etc/cont-init.d/* scripts/*.sh test/*.sh
+          shellcheck -s sh root/etc/services.d/octoprint/run root/etc/services.d/mjpg-streamer/run
+
+      - name: hadolint
+        run: |
+          docker run --rm -i \
+            -v "${PWD}/.hadolint.yaml:/.config/hadolint.yaml:ro" \
+            "hadolint/hadolint:${HADOLINT_VERSION}" hadolint - < Dockerfile
+
+  image:
+    name: ${{ (github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch) && 'build, test, and publish' || 'build and test' }}
+    needs: lint
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      # Full history so the build number can be counted
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          set -euo pipefail
+
+          octoprint_version="$(sed -n "s/^${VERSION_KEY}=//p" "${VERSION_ENV_FILE}")"
+          if [ -z "${octoprint_version}" ]; then
+            echo "::error file=${VERSION_ENV_FILE}::${VERSION_KEY} is not set"
+            exit 1
+          fi
+
+          is_merge() {
+            git rev-parse -q --verify "$1^2" >/dev/null
+          }
+
+          # Squash and rebase merges, and direct pushes, would publish a
+          # version number that doesn't move
+          if [ "${PUBLISH}" = "true" ] && ! is_merge HEAD; then
+            echo "::error::$(git rev-parse --short HEAD) is not a merge commit; only merge commits publish"
+            exit 1
+          fi
+
+          # On a pull request HEAD is the merge commit GitHub would create, so
+          # this is the version the PR would publish
+          base="$(git log --first-parent -1 --format=%H -G "^${VERSION_KEY}=" -- "${VERSION_ENV_FILE}")"
+          build_number="$(git rev-list --count --first-parent --merges "${base}..HEAD")"
+          if is_merge "${base}"; then
+            build_number=$((build_number + 1))
+          fi
+
+          if [ "${build_number}" -eq 0 ]; then
+            echo "::error::no merge commits since ${VERSION_KEY} changed in $(git rev-parse --short "${base}")"
+            exit 1
+          fi
+          version="${octoprint_version}-${build_number}"
+
+          # The -N image tag is meant to be immutable, so refuse to publish a
+          # version that is already tagged on another commit
+          if [ "${PUBLISH}" = "true" ] && git rev-parse -q --verify "refs/tags/${version}" >/dev/null \
+             && [ "$(git rev-parse "${version}^{commit}")" != "${GITHUB_SHA}" ]; then
+            echo "::error::${version} is already tagged on $(git rev-parse "${version}^{commit}")"
+            exit 1
+          fi
+
+          echo "octoprint=${octoprint_version}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Image version ${version} (OctoPrint ${octoprint_version}, counted from ${base})" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -41,29 +135,59 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ env.OCTOPRINT_VERSION }}
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.octoprint }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
-            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Pull requests build only; pushes to main publish
-      - name: Build and push
+      - name: Build
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' && github.ref_name == env.DEFAULT_BRANCH }}
+          load: true
+          platforms: ${{ env.PLATFORMS }}
+          tags: ${{ env.SMOKE_IMAGE }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: test/smoke.sh "${SMOKE_IMAGE}"
+
+      # Same inputs as the build above, so every layer comes from cache
+      - name: Push
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
           platforms: ${{ env.PLATFORMS }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            octoprint_ref=${{ env.OCTOPRINT_VERSION }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+
+      # A re-run of the same commit finds its tag already there
+      - name: Tag the repo
+        if: env.PUBLISH == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "Tag ${VERSION} already exists on this commit"
+            exit 0
+          fi
+
+          git tag "${VERSION}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${VERSION}"

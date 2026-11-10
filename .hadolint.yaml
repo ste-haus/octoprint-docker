@@ -1,0 +1,11 @@
+# Rules ignored here cover upstream's build layers; fixing them would mean
+# restyling or re-pinning upstream code rather than catching real problems.
+ignored:
+  # Pinning every apt package version would break on each Debian point release
+  - DL3008
+  # Upstream's build stage relies on recommended packages being installed
+  - DL3015
+  # The build stage keeps apt lists for the Janus .deb install that follows
+  - DL3009
+  # Upstream splits RUN steps for layer caching
+  - DL3059
