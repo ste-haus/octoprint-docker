@@ -11,6 +11,7 @@ on:
 jobs:
   filters:
     runs-on: ubuntu-latest
+    if: github.repository_owner == 'OctoPrint'
     outputs:
       main: ${{ steps.filter.outputs.main }}
       minimal: ${{ steps.filter.outputs.minimal }}
